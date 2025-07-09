@@ -1,0 +1,250 @@
+#!/usr/bin/tclsh
+# WatchNet - Enhanced BGP Route Monitor Script with EEM Integration
+# Version 2.0 - Production Ready
+#
+# This script monitors specific BGP routes for stability and availability
+# It generates SNMP traps and syslog messages when routes flap or disappear
+#
+# To use with EEM (Embedded Event Manager):
+# event manager applet BGP_ROUTE_MONITOR
+#  event timer watchdog time 60
+#  action 1.0 cli command "enable"
+#  action 2.0 cli command "tclsh flash:watchnet-bgp-monitor.tcl"
+
+# ------------------------------
+# Configuration Section
+# ------------------------------
+array set config {
+    watched_route   "10.1.1.1/32"
+    syslog_server   "172.168.1.1"
+    next_hop        "192.168.2.1"
+    snmp_community  "SnMpSeRvErPaSsWoRd"
+    snmp_timeout    15
+    snmp_retry      2
+    flap_threshold  60
+    debug_mode      0
+}
+
+# ------------------------------
+# Logging Functions
+# ------------------------------
+proc log_message {level message} {
+    global config
+    
+    # Log levels: 0=emergency, 1=alert, 2=critical, 3=error, 4=warning, 5=notice, 6=info, 7=debug
+    set timestamp [clock format [clock seconds] -format "%Y-%m-%d %H:%M:%S"]
+    
+    if {$config(debug_mode)} {
+        puts "$timestamp [$level] $message"
+    }
+    
+    # Send to syslog
+    catch {exec "send log $level $message"}
+}
+
+proc send_snmp_trap {trap_type} {
+    global config
+    
+    set oid_base "1.3.6.1.4.1.9.9.187.2"
+    
+    switch $trap_type {
+        "FLAPPING" {
+            set trap_value "BGP_MAIN_ROUTE_FLAPPING"
+            set severity "warning"
+        }
+        "MISSING" {
+            set trap_value "NO_BGP_MAIN_ROUTE"
+            set severity "critical"
+        }
+        "RECOVERED" {
+            set trap_value "BGP_MAIN_ROUTE_RECOVERED"
+            set severity "info"
+        }
+        default {
+            set trap_value "BGP_ROUTE_UNKNOWN"
+            set severity "error"
+        }
+    }
+    
+    # Construct SNMP inform command
+    set snmp_cmd "snmp inform v2c $config(syslog_server) $config(snmp_community) \
+                  retry $config(snmp_retry) timeout $config(snmp_timeout) \
+                  trap-oid ciscoBgp4MIB.2 \
+                  oid $oid_base.0.1 string $trap_value \
+                  oid $oid_base.0.2 string $config(watched_route) \
+                  oid $oid_base.0.3 string $config(next_hop) \
+                  oid $oid_base.0.4 string $severity"
+    
+    if {[catch {exec $snmp_cmd} result]} {
+        log_message 3 "Failed to send SNMP trap: $result"
+    } else {
+        log_message 6 "SNMP trap sent successfully: $trap_type"
+    }
+}
+
+# ------------------------------
+# Route Analysis Functions
+# ------------------------------
+proc get_route_info {route} {
+    set route_info [dict create exists 0 age_seconds 0 next_hop "" metric 0]
+    
+    # Execute show command
+    if {[catch {exec "show ip route $route"} output]} {
+        return $route_info
+    }
+    
+    # Parse route existence
+    if {[string first "% Network not in table" $output] >= 0} {
+        return $route_info
+    }
+    
+    dict set route_info exists 1
+    
+    # Parse route age
+    if {[regexp {(\d+):(\d+):(\d+)} $output match hours minutes seconds]} {
+        set age_seconds [expr {($hours * 3600) + ($minutes * 60) + $seconds}]
+        dict set route_info age_seconds $age_seconds
+    }
+    
+    # Parse next hop
+    if {[regexp {via ([0-9.]+)} $output match next_hop]} {
+        dict set route_info next_hop $next_hop
+    }
+    
+    # Parse metric
+    if {[regexp {metric (\d+)} $output match metric]} {
+        dict set route_info metric $metric
+    }
+    
+    return $route_info
+}
+
+proc check_route_stability {route_info} {
+    global config
+    
+    if {![dict get $route_info exists]} {
+        return "MISSING"
+    }
+    
+    set age [dict get $route_info age_seconds]
+    if {$age < $config(flap_threshold)} {
+        return "FLAPPING"
+    }
+    
+    return "STABLE"
+}
+
+# ------------------------------
+# State Management
+# ------------------------------
+proc read_previous_state {} {
+    set state_file "/tmp/watchnet_bgp_state.dat"
+    set default_state [dict create last_status "UNKNOWN" last_check 0]
+    
+    if {![file exists $state_file]} {
+        return $default_state
+    }
+    
+    if {[catch {open $state_file r} fh]} {
+        return $default_state
+    }
+    
+    set state_data [read $fh]
+    close $fh
+    
+    if {[catch {eval dict create $state_data} state]} {
+        return $default_state
+    }
+    
+    return $state
+}
+
+proc save_current_state {status} {
+    set state_file "/tmp/watchnet_bgp_state.dat"
+    set current_time [clock seconds]
+    
+    set state [dict create last_status $status last_check $current_time]
+    
+    if {[catch {open $state_file w} fh]} {
+        log_message 4 "Cannot save state to file"
+        return
+    }
+    
+    puts $fh $state
+    close $fh
+}
+
+# ------------------------------
+# Main Execution
+# ------------------------------
+proc main {} {
+    global config
+    
+    log_message 6 "Starting BGP route monitor for $config(watched_route)"
+    
+    # Get current route information
+    set route_info [get_route_info $config(watched_route)]
+    set current_status [check_route_stability $route_info]
+    
+    # Read previous state
+    set prev_state [read_previous_state]
+    set prev_status [dict get $prev_state last_status]
+    
+    # Determine if status changed
+    if {$current_status != $prev_status} {
+        log_message 5 "Route status changed from $prev_status to $current_status"
+        
+        switch $current_status {
+            "MISSING" {
+                log_message 2 "CRITICAL: Main route $config(watched_route) via $config(next_hop) NOT IN TABLE"
+                send_snmp_trap "MISSING"
+            }
+            "FLAPPING" {
+                set age [dict get $route_info age_seconds]
+                log_message 3 "WARNING: Main route $config(watched_route) via $config(next_hop) FLAPPING (age: ${age}s)"
+                send_snmp_trap "FLAPPING"
+            }
+            "STABLE" {
+                if {$prev_status != "UNKNOWN"} {
+                    log_message 5 "INFO: Main route $config(watched_route) via $config(next_hop) RECOVERED"
+                    send_snmp_trap "RECOVERED"
+                }
+            }
+        }
+    } else {
+        # Status unchanged
+        if {$current_status == "MISSING"} {
+            log_message 7 "Route still missing"
+        } elseif {$current_status == "FLAPPING"} {
+            log_message 7 "Route still flapping"
+        } else {
+            log_message 7 "Route stable"
+        }
+    }
+    
+    # Save current state
+    save_current_state $current_status
+    
+    # Output summary if in debug mode
+    if {$config(debug_mode)} {
+        puts "\n=== Route Monitor Summary ==="
+        puts "Route: $config(watched_route)"
+        puts "Status: $current_status"
+        if {[dict get $route_info exists]} {
+            puts "Age: [dict get $route_info age_seconds] seconds"
+            puts "Next Hop: [dict get $route_info next_hop]"
+            puts "Metric: [dict get $route_info metric]"
+        }
+        puts "===========================\n"
+    }
+}
+
+# ------------------------------
+# Script Entry Point
+# ------------------------------
+if {[catch {main} error]} {
+    log_message 1 "Script execution failed: $error"
+    exit 1
+}
+
+exit 0
