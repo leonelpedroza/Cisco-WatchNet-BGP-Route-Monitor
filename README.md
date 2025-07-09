@@ -4,6 +4,10 @@
 [![IOS: 15.0+](https://img.shields.io/badge/IOS-15.0%2B-blue.svg)](https://www.cisco.com)
 [![TCL: 8.3+](https://img.shields.io/badge/TCL-8.3%2B-green.svg)](https://www.tcl.tk/)
 
+Cisco IOS, by default, does not generate a focused alert message in case one specific route starts flapping in its routing table. If for multiple reasons in your network, it’s a necessity to watch a specific host or route inside the routing table in BGP, and if something goes wrong, it's mandatory to generate an alert message to the network helpdesk. 
+
+There are several ways to do this, but this is my specific implementation. This Cisco TLC script watches for a specific BGP route in the current routing table. If the route is not there, it generates an SNMP alert to the company management server and feeds the company syslog server with a level 7 event, to alert the network operational center. Also, if the route has less than a minute at the routing table, generate the alert message.
+
 A TCL-based monitoring script for Cisco IOS routers that tracks specific BGP routes and generates real-time alerts when routes become unstable or disappear from the routing table.
 
 ## 🎯 Overview
